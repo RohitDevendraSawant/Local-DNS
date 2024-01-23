@@ -1,11 +1,11 @@
-import express, { request, response } from "express";
+import express from "express";
 import bodyParser from "body-parser";
-import dns from 'native-dns';
+import redis from 'redis';
+import fetch from "node-fetch";
 
 
 import connectToMongo from "./db.js";
 import DNS from "./models/DNS.js";
-import server from "./dnsServer.js";
 
 
 const PORT = 3000;
@@ -13,56 +13,65 @@ const app = express();
 
 app.use(bodyParser.json());
 
+const redisClient = redis.createClient({
+  password: "nnBgvj4JbozDfNlP8VXBCNanDhos5FYz",
+  socket: {
+    host: "redis-19577.c301.ap-south-1-1.ec2.cloud.redislabs.com",
+    port: 19577,
+  },
+});
+
+(async () => {
+  await redisClient.connect();
+})();
+
+redisClient.on("connect", () => console.log("Redis client connected"));
+redisClient.on("error", (err) =>
+  console.log("Redis client connection error", err)
+);
+
 
 app.get("/api/dns2/getDomainData/:domainName", async (req, res) => {
   try {
-    var question = dns.Question({
-      name: 'www.google.com',
-      type: 'A',
-    });
-     
-    var start = Date.now();
-     
-    var requset = dns.Request({
-      question: question,
-      server: { address: '8.8.8.8', port: 53, type: 'udp' },
-      timeout: 1000,
-    });
-     
-    request.on('timeout', function () {
-      console.log('Timeout in making request');
-    });
-     
-    requset.on('message', function (err, answer) {
-      answer.answer.forEach(function (a) {
-        console.log(a.address);
-      });
-    });
-     
-    request.on('end', function () {
-      var delta = (Date.now()) - start;
-      console.log('Finished processing request: ' + delta.toString() + 'ms');
-    });
-     
-    req.send();
-
-
-
-
-
+    console.log("Requested");
     const domainName = req.params.domainName;
 
-    const domainData = await DNS.findOne({ domain: domainName });
+    let count = await redisClient.hGet(domainName, 'count');
+    if (count == null || count <= 5) {
+      let domainData = await DNS.findOne({ domain: domainName });
 
-    if (!domainData) {
-      return res.status(404).json({ message: "NOTFOUND" });
+      if (domainData) {
+        if (count > 0) {
+          await redisClient.hIncrBy(domainName, 'count', 1);
+        }
+        else{
+          await redisClient.hSet(domainName, 'count', 1);
+        }
+        return res.status(200).json(domainData);
+      }
+    }
+    else{
+      await redisClient.hIncrBy(domainName, 'count', 1);
+      if (count > 5){
+        let record = await redisClient.hGet(domainName, "record");
+        if (record == null) {
+          let domainData = await DNS.findOne({ domain: domainName });
+          await redisClient.hSet(domainName, "record", JSON.stringify(domainData));
+          return res.status(200).json(domainData);
+        }
+        else{
+          let domainData = JSON.parse(record);
+          return res.status(200).json(domainData);
+        }
+      }
     }
 
-    return res.status(200).json(response.answer);
+    return res.status(404).json({message: "NOTFOUND"});
     
   } catch (error) {
     console.log(error);
-    return res.status(500).json({ message: "Internal server error" });
+    return res.status(404).json({message: "NOTFOUND"});
+
   }
 });
 
@@ -91,52 +100,44 @@ app.post("/api/dns2/setDomainData", async (req, res) => {
 
     const newDomainData = new DNS(req.body);
     newDomainData.save();
-    return res.status(200).json({ message: "Domain data saved" });
+    return res.status(201).json({ message: "Domain data saved" });
   } catch (error) {
     console.log(error);
     return res.status(500).json({ message: "Internal server error" });
   }
 });
 
-app.put("/api/dns2/updateDomainData/:id", async (req, res) => {
+app.patch("/api/dns2/updateDomainData", async (req, res) => {
     try {
         const { domain, ip } = req.body;
-        let domainData;
-        try {
-          domainData = await DNS.findById(req.params.id);
-        } catch (error) {
-          return res.status(404).json({ message: "Blog not found." })
-        }
     
-        const updatedDomain = {};
-        if (domain) {
-          updatedDomain.domain = domain;
-        }
-        if (ip) {
-          updatedDomain.ip = ip;
-        }
-    
-        await DNS.findByIdAndUpdate(
-          req.params.id,
-          { $set: updatedDomain },
-          { new: true }
+        const result = await DNS.updateOne(
+          {domain : domain},
+          {ip: ip}
         );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).json({message: "Domain not found"});
+        }
+
+        await redisClient.hSet(domain, 'domain', JSON.stringify({domain, ip}));
+  
     
-        res.status(200).json({ message: "Domain updated successfully." });
+        res.status(201).json({ message: "Domain updated successfully." });
       } catch (error) {
         console.log(error.message);
         res.status(500).json({ message: "Internal server error." });
       }
 });
 
-app.delete("/api/dns2/deleteDomainData/:id", async (req, res) => {
+app.delete("/api/dns2/deleteDomainData/:domainName", async (req, res) => {
     try {
-        let domain = await DNS.findById(req.params.id);
+        let domain = await DNS.findOne({domain: req.params.domainName});
         if (!domain) {
           return res.status(400).json({ message: "Domain not found." });
         }
-    
-        await DNS.findByIdAndDelete(req.params.id);
+        await redisClient.del(req.params.domainName);
+        await DNS.deleteOne({domain: req.params.domainName});
     
         return res.status(200).json({ message: "Domain deleted." });
       } catch (error) {
